@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title="Pro Trading Signals", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Institutional Pro Signals", layout="wide")
 
 st.markdown("""
 <style>
@@ -28,47 +28,49 @@ st.markdown("""
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = None
 
-# Gold removed
+# Assets aligned with your preference
 MAIN_SYMBOLS = {
     "Bitcoin (BTC)": {"ticker": "BTC-USD", "display": "BTC/USD", "category": "Crypto"},
-    "USD/JPY": {"ticker": "USDJPY=X", "display": "USD/JPY", "category": "Forex"},
-    "NAS100": {"ticker": "NQ=F", "display": "NAS100 (NQ)", "category": "Index"},
+    "Ethereum (ETH)": {"ticker": "ETH-USD", "display": "ETH/USD", "category": "Crypto"},
+    "Gold (XAU)": {"ticker": "GC=F", "display": "XAU/USD (Gold)", "category": "Commodity"},
 }
 
 def get_pakistan_time():
     tz = pytz.timezone('Asia/Karachi')
     return datetime.now(tz).strftime("%d %b %Y  |  %I:%M:%S %p PKT")
 
-@st.cache_data(ttl=35, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_ohlcv(ticker, interval="15m", period="5d"):
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         if df is None or df.empty: return None
         df = df.reset_index()
-        # FIX: old code assumed MultiIndex columns are always (Field, Ticker) and
-        # blindly took c[0]. If yfinance ever hands back (Ticker, Field) instead,
-        # that silently mislabels every column. Now it checks which level actually
-        # holds Open/High/Low/Close before picking it.
         if isinstance(df.columns, pd.MultiIndex):
             level0 = set(df.columns.get_level_values(0))
-            if {"Close", "Open", "High", "Low"} & level0:
+            if {"Close", "Open", "High", "Low", "Volume"} & level0:
                 df.columns = [str(c).capitalize() for c in df.columns.get_level_values(0)]
             else:
                 df.columns = [str(c).capitalize() for c in df.columns.get_level_values(1)]
         else:
             df.columns = [str(c).capitalize() for c in df.columns]
+        
         rename_map = {}
         for col in df.columns:
             if "datetime" in col.lower() or "date" in col.lower(): rename_map[col] = "Datetime"
-            elif col.lower() in ["close", "open", "high", "low"]: rename_map[col] = col.capitalize()
+            elif col.lower() in ["close", "open", "high", "low", "volume"]: rename_map[col] = col.capitalize()
         df = df.rename(columns=rename_map)
-        if "Close" not in df.columns: return None
-        return df[["Datetime", "Open", "High", "Low", "Close"]].dropna()
+        
+        req_cols = ["Datetime", "Open", "High", "Low", "Close"]
+        if "Volume" in df.columns:
+            df["Volume"] = df["Volume"].fillna(0)
+            req_cols.append("Volume")
+        else:
+            df["Volume"] = 0
+            req_cols.append("Volume")
+            
+        return df[req_cols].dropna()
     except Exception:
         return None
-
-def ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
 
 def rsi(series, length=14):
     delta = series.diff()
@@ -76,28 +78,16 @@ def rsi(series, length=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=length).mean()
     rs = gain / loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
-    # FIX: when a rolling window has zero losing candles (common during a strong,
-    # one-directional run), the old formula divided by 0 -> inf/NaN. That NaN then
-    # got silently deleted by dropna() further down, which meant the app was
-    # scoring an OLDER candle instead of the true latest one during exactly the
-    # strong-trend moves where a fresh signal matters most.
     result = np.where(loss == 0, np.where(gain == 0, 50, 100), result)
     return pd.Series(result, index=series.index)
 
 def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
-
-def bollinger_bands(series, length=20, std_dev=2):
-    sma = series.rolling(window=length).mean()
-    std = series.rolling(window=length).std()
-    upper = sma + (std * std_dev)
-    lower = sma - (std * std_dev)
-    return upper, sma, lower
 
 def atr(df, length=14):
     high_low = df['High'] - df['Low']
@@ -106,154 +96,144 @@ def atr(df, length=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=length).mean()
 
-def get_recent_candle_streak(df, lookback=15):
-    if len(df) < lookback: lookback = len(df)
-    recent = df.tail(lookback)
-    colors = (recent['Close'] > recent['Open']).astype(int)
-    streak = 1
-    for i in range(len(colors)-2, -1, -1):
-        if colors.iloc[i] == colors.iloc[-1]:
-            streak += 1
-        else:
-            break
-    return streak, colors.iloc[-1]
+def calc_adx(df, period=14):
+    high, low, close = df['High'], df['Low'], df['Close']
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_val = tr.rolling(window=period).mean()
+    plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr_val)
+    minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr_val)
+    di_sum = plus_di + minus_di
+    di_diff = abs(plus_di - minus_di)
+    dx = 100 * (di_diff / di_sum.replace(0, np.nan))
+    dx = dx.fillna(0)
+    adx = dx.rolling(window=period).mean()
+    return adx
 
-def calculate_signal_and_levels(df, tf="15m"):
-    # FIX: Bollinger(20) alone needs 19 warm-up rows before it stops producing NaN,
-    # so the old "len(df) < 30" gate let exactly-30-row inputs through even though
-    # only ~11 rows would survive dropna() -- one short of the 12-row minimum
-    # checked right below. That made perfectly normal timeframes randomly bail out
-    # with "not enough data". Raised to 40 for a safe, consistent margin.
-    if df is None or len(df) < 40: return None
+@st.cache_data(ttl=120, show_spinner=False)
+def get_htf_trend(ticker, current_tf):
+    htf_map = {"5m": "1h", "15m": "1h", "30m": "4h", "1h": "4h", "4h": "1d"}
+    htf = htf_map.get(current_tf, "1h")
+    htf_df = fetch_ohlcv(ticker, interval=htf, period="30d")
+    if htf_df is None or len(htf_df) < 50: return "NEUTRAL", 0
+    htf_df['EMA_50'] = htf_df['Close'].ewm(span=50, adjust=False).mean()
+    htf_df['EMA_200'] = htf_df['Close'].ewm(span=200, adjust=False).mean()
+    last = htf_df.iloc[-1]
+    if last['Close'] > last['EMA_50'] > last['EMA_200']: return "BULLISH", 2
+    elif last['Close'] < last['EMA_50'] < last['EMA_200']: return "BEARISH", -2
+    return "NEUTRAL", 0
+
+def calculate_signal_and_levels(df, ticker, tf="15m"):
+    if df is None or len(df) < 50: return None
     df = df.copy()
     close = df['Close']
-    df['EMA_9'] = ema(close, 9)
-    df['EMA_21'] = ema(close, 21)
+    
+    df['EMA_9'] = close.ewm(span=9, adjust=False).mean()
+    df['EMA_21'] = close.ewm(span=21, adjust=False).mean()
     df['RSI'] = rsi(close, 14)
     _, _, macd_hist = macd(close)
     df['MACD_Hist'] = macd_hist
-    bb_upper, _, bb_lower = bollinger_bands(close)
-    df['BB_Upper'] = bb_upper
-    df['BB_Lower'] = bb_lower
+    df['ADX'] = calc_adx(df, 14)
+    
+    if df['Volume'].sum() > 0:
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        cumulative_tp_vol = (tp * df['Volume']).cumsum()
+        cumulative_vol = df['Volume'].cumsum().replace(0, np.nan)
+        df['VWAP'] = cumulative_tp_vol / cumulative_vol
+        df['VWAP'] = df['VWAP'].fillna(close.rolling(20).mean())
+    else:
+        df['VWAP'] = close.rolling(20).mean()
+        
     df['ATR'] = atr(df, 14)
     df = df.dropna()
     if len(df) < 12: return None
 
     last = df.iloc[-1]
     price = float(last['Close'])
-    ema9 = float(last['EMA_9'])
-    ema21 = float(last['EMA_21'])
+    adx = float(last['ADX'])
+    
+    # 1. Higher Timeframe Trend
+    htf_trend, htf_score = get_htf_trend(ticker, tf)
+    
+    # 2. Scoring System (Professional Confluence)
+    score = htf_score
+    reasons = []
+    reasons.append(f"🌐 HTF Trend ({tf} -> Higher TF): {htf_trend}")
+    
+    # LTF Trend
+    if price > float(last['EMA_9']) > float(last['EMA_21']):
+        score += 2; reasons.append("✅ LTF Strong Bullish (Price > EMA9 > EMA21)")
+    elif price < float(last['EMA_9']) < float(last['EMA_21']):
+        score -= 2; reasons.append("❌ LTF Strong Bearish (Price < EMA9 < EMA21)")
+    else:
+        reasons.append("➖ LTF Mixed/Consolidating")
+        
+    # VWAP (Institutional Level)
+    vwap = float(last['VWAP'])
+    if price > vwap:
+        score += 1; reasons.append("✅ Price Above VWAP (Institutional Bullish Bias)")
+    else:
+        score -= 1; reasons.append("❌ Price Below VWAP (Institutional Bearish Bias)")
+        
+    # Momentum (RSI + MACD)
     rsi_val = float(last['RSI'])
     macd_h = float(last['MACD_Hist'])
-    bb_u = float(last['BB_Upper'])
-    bb_l = float(last['BB_Lower'])
-    atr_val = float(last['ATR'])
-
-    recent_high = float(df['High'].tail(18).max())
-    recent_low = float(df['Low'].tail(18).min())
-
-    high, low, close_p = float(last['High']), float(last['Low']), float(last['Close'])
-    pp = (high + low + close_p) / 3
-    r1 = 2 * pp - low
-    s1 = 2 * pp - high
-
-    score = 0
-    reasons = []
-
-    # Stronger confluence
-    if price > ema9 > ema21:
-        score += 2; reasons.append("✅ Strong bullish EMA alignment")
-    elif price > ema9:
-        score += 1; reasons.append("✅ Price above EMA9")
-    elif price < ema9 < ema21:
-        score -= 2; reasons.append("❌ Bearish EMA alignment")
-    elif price < ema9:
-        # FIX: this mirror case didn't exist before, so a price fading below EMA9
-        # without a full bearish stack scored 0 instead of leaning bearish like the
-        # equivalent bullish case does -- quietly biasing every signal long.
-        score -= 1; reasons.append("❌ Price below EMA9")
-
-    if rsi_val > 58: score += 1; reasons.append("✅ RSI strong bullish")
-    elif rsi_val < 42: score -= 1; reasons.append("❌ RSI strong bearish")
-
-    # FIX: MACD used to always hand out +1 or -1, even with the histogram sitting
-    # basically at zero, which whipsawed the signal back and forth right at every
-    # crossover. It now needs to clear a small ATR-scaled deadzone, so the "flat"
-    # threshold auto-scales for BTC vs USDJPY vs NAS100 instead of one fixed number.
-    macd_deadzone = atr_val * 0.05
-    if macd_h > macd_deadzone:
-        score += 1; reasons.append("✅ MACD histogram positive")
-    elif macd_h < -macd_deadzone:
-        score -= 1; reasons.append("❌ MACD histogram negative")
-    else:
-        reasons.append("➖ MACD histogram near zero (weak momentum)")
-
-    if price <= bb_l * 1.008: score += 1; reasons.append("✅ Near lower Bollinger (potential bounce)")
-    elif price >= bb_u * 0.992: score -= 1; reasons.append("❌ Near upper Bollinger (potential rejection)")
-
-    # Candle structure — confirms an existing bias, doesn't invent one
-    streak, last_color = get_recent_candle_streak(df, 12)
-    # FIX: this used to test `"BUY" in str(score)` — comparing a plain number's
-    # string form against the word "BUY", which is never true — and it ran before
-    # signal_type even existed yet. So this confirmation bonus never fired, for
-    # any market condition, ever. It now checks the score's sign directly.
-    if streak >= 5:
-        if last_color == 1 and score > 0:
-            score += 1; reasons.append(f"✅ {streak} straight green candles confirm bulls")
-        elif last_color == 0 and score < 0:
-            score -= 1; reasons.append(f"❌ {streak} straight red candles confirm bears")
+    if rsi_val > 55 and macd_h > 0:
+        score += 1; reasons.append("✅ Bullish Momentum (RSI>55 + MACD+)")
+    elif rsi_val < 45 and macd_h < 0:
+        score -= 1; reasons.append("❌ Bearish Momentum (RSI<45 + MACD-)")
+        
+    # Trend Strength (ADX) - The Dead Signal Killer
+    if adx < 20:
+        reasons.append("⚠️ ADX < 20: Market is RANGING (Dead Signal Filtered)")
+        if score > 1: score = 1
+        elif score < -1: score = -1
 
     if score >= 4: signal_type, badge_class = "STRONG BUY", "strong-buy"
     elif score >= 2: signal_type, badge_class = "BUY", "buy"
     elif score <= -4: signal_type, badge_class = "STRONG SELL", "strong-sell"
     elif score <= -2: signal_type, badge_class = "SELL", "sell"
-    else: signal_type, badge_class = "NEUTRAL", "neutral"
+    else: signal_type, badge_class = "WAIT / NEUTRAL", "neutral"
 
-    # Realistic TP/SL
+    # SL / TP Logic based on Market Structure (Swing High/Low)
+    lookback = min(50, len(df))
+    recent_high = float(df['High'].tail(lookback).max())
+    recent_low = float(df['Low'].tail(lookback).min())
+    atr_val = float(last['ATR'])
+    
     if "BUY" in signal_type:
         entry = round(price, 2)
-        sl = round(min(recent_low, s1) - (atr_val * 0.45), 2)
-        actual_risk = entry - sl
-        risk = max(actual_risk, atr_val * 0.65)
-        tp1 = round(entry + risk * 1.7, 2)
+        sl = round(recent_low - (atr_val * 0.5), 2)
+        risk = entry - sl
+        if risk <= 0: risk = atr_val
+        tp1 = round(entry + risk * 1.5, 2)
         tp2 = round(entry + risk * 2.5, 2)
-        tp3 = round(max(r1, entry + risk * 3.5), 2)
-        # FIX: R:R used to be the hardcoded string "1 : 1.7+" no matter what,
-        # even when the ATR floor had actually widened the real stop distance.
-        # Now it's computed from the real entry/sl/tp1 numbers.
-        rr = f"1 : {round((tp1 - entry) / actual_risk, 1)}" if actual_risk > 0 else "N/A"
+        tp3 = round(recent_high, 2) # Target the range high
+        rr = f"1 : {round((tp1 - entry) / risk, 1)}"
     elif "SELL" in signal_type:
         entry = round(price, 2)
-        sl = round(max(recent_high, r1) + (atr_val * 0.45), 2)
-        actual_risk = sl - entry
-        risk = max(actual_risk, atr_val * 0.65)
-        tp1 = round(entry - risk * 1.7, 2)
+        sl = round(recent_high + (atr_val * 0.5), 2)
+        risk = sl - entry
+        if risk <= 0: risk = atr_val
+        tp1 = round(entry - risk * 1.5, 2)
         tp2 = round(entry - risk * 2.5, 2)
-        tp3 = round(min(s1, entry - risk * 3.5), 2)
-        rr = f"1 : {round((entry - tp1) / actual_risk, 1)}" if actual_risk > 0 else "N/A"
+        tp3 = round(recent_low, 2) # Target the range low
+        rr = f"1 : {round((entry - tp1) / risk, 1)}"
     else:
         entry = sl = tp1 = tp2 = tp3 = round(price, 2)
         rr = "N/A"
-
-    # Smart Candle Prediction (reuses the streak computed above — no need to redo it)
-    base = max(3, min(9, int(abs(score) * 1.5)))
-
-    if "BUY" in signal_type:
-        expected = f"{base}–{base+3} green candles expected"
-        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} red candles pullback"
-    elif "SELL" in signal_type:
-        expected = f"{base}–{base+3} red candles expected"
-        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} green candles pullback"
-    else:
-        expected = "Market is neutral"
-        pullback = ""
-
+        
     return {
         "signal": signal_type, "badge_class": badge_class, "score": score, "reasons": reasons,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr,
-        "rsi": round(rsi_val, 1), "ema9": round(ema9, 2), "ema21": round(ema21, 2),
-        "atr": round(atr_val, 2), "last_price": round(price, 2),
-        "expected_candles": expected, "pullback": pullback
+        "rsi": round(rsi_val, 1), "adx": round(adx, 1), "atr": round(atr_val, 2), 
+        "vwap": round(vwap, 2), "last_price": round(price, 2)
     }
 
 def build_chart(df, analysis, symbol_name, tf):
@@ -262,6 +242,10 @@ def build_chart(df, analysis, symbol_name, tf):
     fig.add_trace(go.Candlestick(x=df['Datetime'], open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'], name="Price",
         increasing_line_color="#00c853", decreasing_line_color="#f44336"))
+
+    if 'VWAP' in df.columns:
+        fig.add_trace(go.Scatter(x=df['Datetime'], y=df['VWAP'], mode='lines', 
+            name='VWAP', line=dict(color='#ffeb3b', width=1, dash='dash')))
 
     last_price = float(df['Close'].iloc[-1])
     if "BUY" in analysis['signal']:
@@ -277,8 +261,25 @@ def build_chart(df, analysis, symbol_name, tf):
         height=400, margin=dict(l=10, r=10, t=50, b=10), xaxis_rangeslider_visible=False)
     return fig
 
-st.markdown('<h1 class="main-header">📈 Pro Trading Signals</h1>', unsafe_allow_html=True)
-st.caption(f"Pakistan Time: {get_pakistan_time()}  |  BTC • USDJPY • NAS100")
+st.markdown('<h1 class="main-header">📈 Institutional Pro Signals</h1>', unsafe_allow_html=True)
+st.caption(f"Pakistan Time: {get_pakistan_time()}  |  BTC • ETH • Gold")
+
+# Actionable Snapshots (No Noise)
+with st.expander("📱 Daily Actionable Snapshots (No Noise)"):
+    if st.button("Generate Clean Levels"):
+        snapshot_text = "📊 **ACTIONABLE LEVELS ONLY - NO NOISE**\n\n"
+        for name, meta in MAIN_SYMBOLS.items():
+            df_snap = fetch_ohlcv(meta['ticker'], interval="1h", period="7d")
+            anal = calculate_signal_and_levels(df_snap, meta['ticker'], "1h")
+            if anal and "NEUTRAL" not in anal['signal'] and "WAIT" not in anal['signal']:
+                snapshot_text += f"**{meta['display']} ({anal['signal']})**\n"
+                snapshot_text += f"Entry: {anal['entry']} | SL: {anal['sl']}\n"
+                snapshot_text += f"TP1: {anal['tp1']} | TP2: {anal['tp2']} | TP3: {anal['tp3']}\n"
+                snapshot_text += f"R:R -> {anal['rr']}\n"
+                snapshot_text += f"Rule: Wait for 15m candle close to confirm.\n\n"
+            else:
+                snapshot_text += f"**{meta['display']}**: ⚠️ NO TRADE (Market Ranging/Neutral)\n\n"
+        st.code(snapshot_text)
 
 if st.button("🔄 Refresh All Data"):
     st.cache_data.clear()
@@ -290,12 +291,12 @@ for idx, (disp_name, meta) in enumerate(list(MAIN_SYMBOLS.items())):
     col = cols[idx % 3]
     with col:
         ticker = meta["ticker"]
-        quick_df = fetch_ohlcv(ticker, interval="60m", period="2d")
-        price, pct, sig, badge = 0, 0, "NEUTRAL", "neutral"
+        quick_df = fetch_ohlcv(ticker, interval="1h", period="3d")
+        price, pct, sig, badge = 0, 0, "WAIT", "neutral"
         if quick_df is not None and len(quick_df) > 1:
             price = float(quick_df['Close'].iloc[-1])
             pct = ((price - float(quick_df['Close'].iloc[0])) / float(quick_df['Close'].iloc[0])) * 100
-            anal = calculate_signal_and_levels(quick_df)
+            anal = calculate_signal_and_levels(quick_df, ticker, "1h")
             if anal: sig, badge = anal["signal"], anal["badge_class"]
 
         st.markdown(f"""
@@ -319,48 +320,41 @@ if st.session_state.selected_symbol:
     st.divider()
     st.subheader(f"📊 {selected}")
 
-    tf = st.selectbox("Timeframe", ["5m", "15m", "30m", "1h", "4h"], index=2)
-    period_map = {"5m": "3d", "15m": "5d", "30m": "7d", "1h": "14d", "4h": "30d"}
+    tf = st.selectbox("Timeframe", ["5m", "15m", "30m", "1h", "4h"], index=1)
+    period_map = {"5m": "3d", "15m": "5d", "30m": "7d", "1h": "14d", "4h": "60d"}
 
     df = fetch_ohlcv(ticker, interval=tf, period=period_map[tf])
-    analysis = calculate_signal_and_levels(df)
+    analysis = calculate_signal_and_levels(df, ticker, tf)
 
     if analysis:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Price", f"{analysis['last_price']}")
         c2.metric("Signal", analysis['signal'])
         c3.metric("RSI", analysis['rsi'])
-        c4.metric("ATR", analysis['atr'])
+        c4.metric("ADX", analysis['adx'])
+        c5.metric("VWAP", analysis['vwap'])
 
-        # Chart at bottom
         fig = build_chart(df, analysis, selected, tf)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("### 🎯 Trade Setup")
+        st.markdown("### 🎯 Institutional Trade Setup")
         st.markdown(f"<span class='signal-badge {analysis['badge_class']}' style='font-size:1.3rem; padding:0.4rem 1.2rem;'>{analysis['signal']}</span>", unsafe_allow_html=True)
 
         st.markdown(f"""
         <div class="trade-box">
         <b>Entry:</b> {analysis['entry']}<br>
-        <b>Stop Loss:</b> {analysis['sl']}<br>
-        <b>TP1:</b> {analysis['tp1']} | <b>TP2:</b> {analysis['tp2']} | <b>TP3:</b> {analysis['tp3']}<br>
-        <b>Risk : Reward</b> → {analysis['rr']}
+        <b>Stop Loss (Structure):</b> {analysis['sl']}<br>
+        <b>TP1:</b> {analysis['tp1']} | <b>TP2:</b> {analysis['tp2']} | <b>TP3 (Structure):</b> {analysis['tp3']}<br>
+        <b>Risk : Reward</b> → {analysis['rr']}<br>
+        <b>Rule:</b> Risk max 1-2% of account. Wait for candle close.
         </div>
         """, unsafe_allow_html=True)
 
-        st.code(f"Entry: {analysis['entry']}\nSL: {analysis['sl']}\nTP1: {analysis['tp1']}  TP2: {analysis['tp2']}  TP3: {analysis['tp3']}")
-
-        st.markdown("### 🕯️ Expected Candles")
-        st.info(analysis['expected_candles'])
-        if analysis.get('pullback'):
-            st.warning(analysis['pullback'])
-
-        st.markdown("### 🧠 Why this signal?")
+        st.markdown("### 🧠 Confluence & Logic")
         for r in analysis['reasons']:
             st.write(r)
     else:
         st.error("Not enough data for this timeframe. Try higher timeframe.")
 
-st.caption("Professional Signals • Free Tier • Data via yfinance • Verify with your broker")
-    
+st.caption("Professional Institutional Signals • Dead Logic Removed • Data via yfinance")
