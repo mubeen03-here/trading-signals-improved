@@ -45,7 +45,18 @@ def fetch_ohlcv(ticker, interval="15m", period="5d"):
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         if df is None or df.empty: return None
         df = df.reset_index()
-        df.columns = [str(c[0]).capitalize() if isinstance(c, tuple) else str(c).capitalize() for c in df.columns]
+        # FIX: old code assumed MultiIndex columns are always (Field, Ticker) and
+        # blindly took c[0]. If yfinance ever hands back (Ticker, Field) instead,
+        # that silently mislabels every column. Now it checks which level actually
+        # holds Open/High/Low/Close before picking it.
+        if isinstance(df.columns, pd.MultiIndex):
+            level0 = set(df.columns.get_level_values(0))
+            if {"Close", "Open", "High", "Low"} & level0:
+                df.columns = [str(c).capitalize() for c in df.columns.get_level_values(0)]
+            else:
+                df.columns = [str(c).capitalize() for c in df.columns.get_level_values(1)]
+        else:
+            df.columns = [str(c).capitalize() for c in df.columns]
         rename_map = {}
         for col in df.columns:
             if "datetime" in col.lower() or "date" in col.lower(): rename_map[col] = "Datetime"
@@ -53,7 +64,7 @@ def fetch_ohlcv(ticker, interval="15m", period="5d"):
         df = df.rename(columns=rename_map)
         if "Close" not in df.columns: return None
         return df[["Datetime", "Open", "High", "Low", "Close"]].dropna()
-    except:
+    except Exception:
         return None
 
 def ema(series, length):
@@ -63,8 +74,15 @@ def rsi(series, length=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=length).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=length).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    rs = gain / loss.replace(0, np.nan)
+    result = 100 - (100 / (1 + rs))
+    # FIX: when a rolling window has zero losing candles (common during a strong,
+    # one-directional run), the old formula divided by 0 -> inf/NaN. That NaN then
+    # got silently deleted by dropna() further down, which meant the app was
+    # scoring an OLDER candle instead of the true latest one during exactly the
+    # strong-trend moves where a fresh signal matters most.
+    result = np.where(loss == 0, np.where(gain == 0, 50, 100), result)
+    return pd.Series(result, index=series.index)
 
 def macd(series, fast=12, slow=26, signal=9):
     ema_fast = ema(series, fast)
@@ -101,7 +119,12 @@ def get_recent_candle_streak(df, lookback=15):
     return streak, colors.iloc[-1]
 
 def calculate_signal_and_levels(df, tf="15m"):
-    if df is None or len(df) < 30: return None
+    # FIX: Bollinger(20) alone needs 19 warm-up rows before it stops producing NaN,
+    # so the old "len(df) < 30" gate let exactly-30-row inputs through even though
+    # only ~11 rows would survive dropna() -- one short of the 12-row minimum
+    # checked right below. That made perfectly normal timeframes randomly bail out
+    # with "not enough data". Raised to 40 for a safe, consistent margin.
+    if df is None or len(df) < 40: return None
     df = df.copy()
     close = df['Close']
     df['EMA_9'] = ema(close, 9)
@@ -115,7 +138,7 @@ def calculate_signal_and_levels(df, tf="15m"):
     df['ATR'] = atr(df, 14)
     df = df.dropna()
     if len(df) < 12: return None
-    
+
     last = df.iloc[-1]
     price = float(last['Close'])
     ema9 = float(last['EMA_9'])
@@ -125,18 +148,18 @@ def calculate_signal_and_levels(df, tf="15m"):
     bb_u = float(last['BB_Upper'])
     bb_l = float(last['BB_Lower'])
     atr_val = float(last['ATR'])
-    
+
     recent_high = float(df['High'].tail(18).max())
     recent_low = float(df['Low'].tail(18).min())
-    
+
     high, low, close_p = float(last['High']), float(last['Low']), float(last['Close'])
     pp = (high + low + close_p) / 3
     r1 = 2 * pp - low
     s1 = 2 * pp - high
-    
+
     score = 0
     reasons = []
-    
+
     # Stronger confluence
     if price > ema9 > ema21:
         score += 2; reasons.append("✅ Strong bullish EMA alignment")
@@ -144,53 +167,77 @@ def calculate_signal_and_levels(df, tf="15m"):
         score += 1; reasons.append("✅ Price above EMA9")
     elif price < ema9 < ema21:
         score -= 2; reasons.append("❌ Bearish EMA alignment")
-    
+    elif price < ema9:
+        # FIX: this mirror case didn't exist before, so a price fading below EMA9
+        # without a full bearish stack scored 0 instead of leaning bearish like the
+        # equivalent bullish case does -- quietly biasing every signal long.
+        score -= 1; reasons.append("❌ Price below EMA9")
+
     if rsi_val > 58: score += 1; reasons.append("✅ RSI strong bullish")
     elif rsi_val < 42: score -= 1; reasons.append("❌ RSI strong bearish")
-    
-    if macd_h > 0: score += 1; reasons.append("✅ MACD histogram positive")
-    else: score -= 1; reasons.append("❌ MACD histogram negative")
-    
+
+    # FIX: MACD used to always hand out +1 or -1, even with the histogram sitting
+    # basically at zero, which whipsawed the signal back and forth right at every
+    # crossover. It now needs to clear a small ATR-scaled deadzone, so the "flat"
+    # threshold auto-scales for BTC vs USDJPY vs NAS100 instead of one fixed number.
+    macd_deadzone = atr_val * 0.05
+    if macd_h > macd_deadzone:
+        score += 1; reasons.append("✅ MACD histogram positive")
+    elif macd_h < -macd_deadzone:
+        score -= 1; reasons.append("❌ MACD histogram negative")
+    else:
+        reasons.append("➖ MACD histogram near zero (weak momentum)")
+
     if price <= bb_l * 1.008: score += 1; reasons.append("✅ Near lower Bollinger (potential bounce)")
     elif price >= bb_u * 0.992: score -= 1; reasons.append("❌ Near upper Bollinger (potential rejection)")
-    
-    # Candle structure
+
+    # Candle structure — confirms an existing bias, doesn't invent one
     streak, last_color = get_recent_candle_streak(df, 12)
+    # FIX: this used to test `"BUY" in str(score)` — comparing a plain number's
+    # string form against the word "BUY", which is never true — and it ran before
+    # signal_type even existed yet. So this confirmation bonus never fired, for
+    # any market condition, ever. It now checks the score's sign directly.
     if streak >= 5:
-        if last_color == 1 and "BUY" in str(score): score += 1
-        if last_color == 0 and "SELL" in str(score): score += 1
-    
+        if last_color == 1 and score > 0:
+            score += 1; reasons.append(f"✅ {streak} straight green candles confirm bulls")
+        elif last_color == 0 and score < 0:
+            score -= 1; reasons.append(f"❌ {streak} straight red candles confirm bears")
+
     if score >= 4: signal_type, badge_class = "STRONG BUY", "strong-buy"
     elif score >= 2: signal_type, badge_class = "BUY", "buy"
     elif score <= -4: signal_type, badge_class = "STRONG SELL", "strong-sell"
     elif score <= -2: signal_type, badge_class = "SELL", "sell"
     else: signal_type, badge_class = "NEUTRAL", "neutral"
-    
+
     # Realistic TP/SL
     if "BUY" in signal_type:
         entry = round(price, 2)
         sl = round(min(recent_low, s1) - (atr_val * 0.45), 2)
-        risk = max(entry - sl, atr_val * 0.65)
+        actual_risk = entry - sl
+        risk = max(actual_risk, atr_val * 0.65)
         tp1 = round(entry + risk * 1.7, 2)
         tp2 = round(entry + risk * 2.5, 2)
         tp3 = round(max(r1, entry + risk * 3.5), 2)
-        rr = "1 : 1.7+"
+        # FIX: R:R used to be the hardcoded string "1 : 1.7+" no matter what,
+        # even when the ATR floor had actually widened the real stop distance.
+        # Now it's computed from the real entry/sl/tp1 numbers.
+        rr = f"1 : {round((tp1 - entry) / actual_risk, 1)}" if actual_risk > 0 else "N/A"
     elif "SELL" in signal_type:
         entry = round(price, 2)
         sl = round(max(recent_high, r1) + (atr_val * 0.45), 2)
-        risk = max(sl - entry, atr_val * 0.65)
+        actual_risk = sl - entry
+        risk = max(actual_risk, atr_val * 0.65)
         tp1 = round(entry - risk * 1.7, 2)
         tp2 = round(entry - risk * 2.5, 2)
         tp3 = round(min(s1, entry - risk * 3.5), 2)
-        rr = "1 : 1.7+"
+        rr = f"1 : {round((entry - tp1) / actual_risk, 1)}" if actual_risk > 0 else "N/A"
     else:
         entry = sl = tp1 = tp2 = tp3 = round(price, 2)
         rr = "N/A"
-    
-    # Smart Candle Prediction
-    streak, last_color = get_recent_candle_streak(df, 12)
+
+    # Smart Candle Prediction (reuses the streak computed above — no need to redo it)
     base = max(3, min(9, int(abs(score) * 1.5)))
-    
+
     if "BUY" in signal_type:
         expected = f"{base}–{base+3} green candles expected"
         pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} red candles pullback"
@@ -200,7 +247,7 @@ def calculate_signal_and_levels(df, tf="15m"):
     else:
         expected = "Market is neutral"
         pullback = ""
-    
+
     return {
         "signal": signal_type, "badge_class": badge_class, "score": score, "reasons": reasons,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr,
@@ -215,7 +262,7 @@ def build_chart(df, analysis, symbol_name, tf):
     fig.add_trace(go.Candlestick(x=df['Datetime'], open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'], name="Price",
         increasing_line_color="#00c853", decreasing_line_color="#f44336"))
-    
+
     last_price = float(df['Close'].iloc[-1])
     if "BUY" in analysis['signal']:
         fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price*0.992,
@@ -225,7 +272,7 @@ def build_chart(df, analysis, symbol_name, tf):
         fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price*1.008,
             text="▼ SHORT", showarrow=True, arrowhead=2, arrowsize=1.8,
             arrowcolor="#f44336", font=dict(color="#f44336", size=15, family="Arial Black"))
-    
+
     fig.update_layout(title=f"{symbol_name} — {tf} | {analysis['signal']}", template="plotly_dark",
         height=400, margin=dict(l=10, r=10, t=50, b=10), xaxis_rangeslider_visible=False)
     return fig
@@ -250,7 +297,7 @@ for idx, (disp_name, meta) in enumerate(list(MAIN_SYMBOLS.items())):
             pct = ((price - float(quick_df['Close'].iloc[0])) / float(quick_df['Close'].iloc[0])) * 100
             anal = calculate_signal_and_levels(quick_df)
             if anal: sig, badge = anal["signal"], anal["badge_class"]
-        
+
         st.markdown(f"""
         <div class="symbol-card">
             <strong>{meta['display']}</strong><br>
@@ -259,7 +306,7 @@ for idx, (disp_name, meta) in enumerate(list(MAIN_SYMBOLS.items())):
             <span class="signal-badge {badge}">{sig}</span>
         </div>
         """, unsafe_allow_html=True)
-        
+
         if st.button(f"View Analysis", key=f"btn_{disp_name}"):
             st.session_state.selected_symbol = disp_name
             st.rerun()
@@ -271,28 +318,28 @@ if st.session_state.selected_symbol:
     ticker = meta.get("ticker", "")
     st.divider()
     st.subheader(f"📊 {selected}")
-    
+
     tf = st.selectbox("Timeframe", ["5m", "15m", "30m", "1h", "4h"], index=2)
     period_map = {"5m": "3d", "15m": "5d", "30m": "7d", "1h": "14d", "4h": "30d"}
-    
+
     df = fetch_ohlcv(ticker, interval=tf, period=period_map[tf])
     analysis = calculate_signal_and_levels(df)
-    
+
     if analysis:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Price", f"{analysis['last_price']}")
         c2.metric("Signal", analysis['signal'])
         c3.metric("RSI", analysis['rsi'])
         c4.metric("ATR", analysis['atr'])
-        
+
         # Chart at bottom
         fig = build_chart(df, analysis, selected, tf)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
-        
+
         st.markdown("### 🎯 Trade Setup")
         st.markdown(f"<span class='signal-badge {analysis['badge_class']}' style='font-size:1.3rem; padding:0.4rem 1.2rem;'>{analysis['signal']}</span>", unsafe_allow_html=True)
-        
+
         st.markdown(f"""
         <div class="trade-box">
         <b>Entry:</b> {analysis['entry']}<br>
@@ -301,14 +348,14 @@ if st.session_state.selected_symbol:
         <b>Risk : Reward</b> → {analysis['rr']}
         </div>
         """, unsafe_allow_html=True)
-        
+
         st.code(f"Entry: {analysis['entry']}\nSL: {analysis['sl']}\nTP1: {analysis['tp1']}  TP2: {analysis['tp2']}  TP3: {analysis['tp3']}")
-        
+
         st.markdown("### 🕯️ Expected Candles")
         st.info(analysis['expected_candles'])
         if analysis.get('pullback'):
             st.warning(analysis['pullback'])
-        
+
         st.markdown("### 🧠 Why this signal?")
         for r in analysis['reasons']:
             st.write(r)
@@ -316,3 +363,4 @@ if st.session_state.selected_symbol:
         st.error("Not enough data for this timeframe. Try higher timeframe.")
 
 st.caption("Professional Signals • Free Tier • Data via yfinance • Verify with your broker")
+    
