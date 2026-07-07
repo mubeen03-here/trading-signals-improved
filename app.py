@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
+import pytz
 
 st.set_page_config(page_title="Pro Trading Signals", layout="wide", initial_sidebar_state="expanded")
 
@@ -19,7 +20,7 @@ st.markdown("""
     .neutral { background-color: #ff9800; color: white; }
     .sell { background-color: #f44336; color: white; }
     .strong-sell { background-color: #d32f2f; color: white; }
-    .metric-value { font-size: 1.65rem; font-weight: 700; }
+    .metric-value { font-size: 1.7rem; font-weight: 700; }
     .trade-box { background-color: #161b22; border: 2px solid #00b8ff; border-radius: 12px; padding: 1rem; margin: 0.5rem 0; }
 </style>
 """, unsafe_allow_html=True)
@@ -27,14 +28,18 @@ st.markdown("""
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = None
 
-# Gold hata diya
+# Gold removed
 MAIN_SYMBOLS = {
     "Bitcoin (BTC)": {"ticker": "BTC-USD", "display": "BTC/USD", "category": "Crypto"},
     "USD/JPY": {"ticker": "USDJPY=X", "display": "USD/JPY", "category": "Forex"},
     "NAS100": {"ticker": "NQ=F", "display": "NAS100 (NQ)", "category": "Index"},
 }
 
-@st.cache_data(ttl=40, show_spinner=False)
+def get_pakistan_time():
+    tz = pytz.timezone('Asia/Karachi')
+    return datetime.now(tz).strftime("%d %b %Y  |  %I:%M:%S %p PKT")
+
+@st.cache_data(ttl=35, show_spinner=False)
 def fetch_ohlcv(ticker, interval="15m", period="5d"):
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
@@ -83,24 +88,20 @@ def atr(df, length=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=length).mean()
 
-def get_candle_prediction(signal_type, score, recent_green, recent_red):
-    """Professional style candle prediction"""
-    base = max(3, min(8, int(score * 1.3)))
-    
-    if "BUY" in signal_type:
-        expected = f"{base}-{base+3} green candles"
-        pullback = f"Possible {max(1, base//3)}-{max(2, base//2)} red candles in between"
-    elif "SELL" in signal_type:
-        expected = f"{base}-{base+3} red candles"
-        pullback = f"Possible {max(1, base//3)}-{max(2, base//2)} green candles in between"
-    else:
-        expected = "Market is neutral"
-        pullback = ""
-    
-    return expected, pullback
+def get_recent_candle_streak(df, lookback=15):
+    if len(df) < lookback: lookback = len(df)
+    recent = df.tail(lookback)
+    colors = (recent['Close'] > recent['Open']).astype(int)
+    streak = 1
+    for i in range(len(colors)-2, -1, -1):
+        if colors.iloc[i] == colors.iloc[-1]:
+            streak += 1
+        else:
+            break
+    return streak, colors.iloc[-1]
 
-def calculate_signal_and_levels(df):
-    if df is None or len(df) < 25: return None
+def calculate_signal_and_levels(df, tf="15m"):
+    if df is None or len(df) < 30: return None
     df = df.copy()
     close = df['Close']
     df['EMA_9'] = ema(close, 9)
@@ -113,7 +114,7 @@ def calculate_signal_and_levels(df):
     df['BB_Lower'] = bb_lower
     df['ATR'] = atr(df, 14)
     df = df.dropna()
-    if len(df) < 10: return None
+    if len(df) < 12: return None
     
     last = df.iloc[-1]
     price = float(last['Close'])
@@ -125,8 +126,8 @@ def calculate_signal_and_levels(df):
     bb_l = float(last['BB_Lower'])
     atr_val = float(last['ATR'])
     
-    recent_high = float(df['High'].tail(15).max())
-    recent_low = float(df['Low'].tail(15).min())
+    recent_high = float(df['High'].tail(18).max())
+    recent_low = float(df['Low'].tail(18).min())
     
     high, low, close_p = float(last['High']), float(last['Low']), float(last['Close'])
     pp = (high + low + close_p) / 3
@@ -136,18 +137,28 @@ def calculate_signal_and_levels(df):
     score = 0
     reasons = []
     
-    if price > ema9 > ema21: score += 2; reasons.append("✅ Strong bullish EMA alignment")
-    elif price > ema9: score += 1; reasons.append("✅ Price above EMA9")
-    elif price < ema9 < ema21: score -= 2; reasons.append("❌ Bearish EMA alignment")
+    # Stronger confluence
+    if price > ema9 > ema21:
+        score += 2; reasons.append("✅ Strong bullish EMA alignment")
+    elif price > ema9:
+        score += 1; reasons.append("✅ Price above EMA9")
+    elif price < ema9 < ema21:
+        score -= 2; reasons.append("❌ Bearish EMA alignment")
     
-    if rsi_val > 55: score += 1; reasons.append("✅ RSI bullish momentum")
-    elif rsi_val < 45: score -= 1; reasons.append("❌ RSI bearish momentum")
+    if rsi_val > 58: score += 1; reasons.append("✅ RSI strong bullish")
+    elif rsi_val < 42: score -= 1; reasons.append("❌ RSI strong bearish")
     
     if macd_h > 0: score += 1; reasons.append("✅ MACD histogram positive")
     else: score -= 1; reasons.append("❌ MACD histogram negative")
     
-    if price <= bb_l * 1.005: score += 1; reasons.append("✅ Near lower Bollinger Band")
-    elif price >= bb_u * 0.995: score -= 1; reasons.append("❌ Near upper Bollinger Band")
+    if price <= bb_l * 1.008: score += 1; reasons.append("✅ Near lower Bollinger (potential bounce)")
+    elif price >= bb_u * 0.992: score -= 1; reasons.append("❌ Near upper Bollinger (potential rejection)")
+    
+    # Candle structure
+    streak, last_color = get_recent_candle_streak(df, 12)
+    if streak >= 5:
+        if last_color == 1 and "BUY" in str(score): score += 1
+        if last_color == 0 and "SELL" in str(score): score += 1
     
     if score >= 4: signal_type, badge_class = "STRONG BUY", "strong-buy"
     elif score >= 2: signal_type, badge_class = "BUY", "buy"
@@ -158,26 +169,37 @@ def calculate_signal_and_levels(df):
     # Realistic TP/SL
     if "BUY" in signal_type:
         entry = round(price, 2)
-        sl = round(min(recent_low, s1) - (atr_val * 0.5), 2)
-        risk = max(entry - sl, atr_val * 0.7)
-        tp1 = round(entry + risk * 1.6, 2)
-        tp2 = round(entry + risk * 2.3, 2)
-        tp3 = round(max(r1, entry + risk * 3.2), 2)
-        rr = "1 : 1.6+"
+        sl = round(min(recent_low, s1) - (atr_val * 0.45), 2)
+        risk = max(entry - sl, atr_val * 0.65)
+        tp1 = round(entry + risk * 1.7, 2)
+        tp2 = round(entry + risk * 2.5, 2)
+        tp3 = round(max(r1, entry + risk * 3.5), 2)
+        rr = "1 : 1.7+"
     elif "SELL" in signal_type:
         entry = round(price, 2)
-        sl = round(max(recent_high, r1) + (atr_val * 0.5), 2)
-        risk = max(sl - entry, atr_val * 0.7)
-        tp1 = round(entry - risk * 1.6, 2)
-        tp2 = round(entry - risk * 2.3, 2)
-        tp3 = round(min(s1, entry - risk * 3.2), 2)
-        rr = "1 : 1.6+"
+        sl = round(max(recent_high, r1) + (atr_val * 0.45), 2)
+        risk = max(sl - entry, atr_val * 0.65)
+        tp1 = round(entry - risk * 1.7, 2)
+        tp2 = round(entry - risk * 2.5, 2)
+        tp3 = round(min(s1, entry - risk * 3.5), 2)
+        rr = "1 : 1.7+"
     else:
         entry = sl = tp1 = tp2 = tp3 = round(price, 2)
         rr = "N/A"
     
-    green, red = get_recent_candle_color(df, 12)
-    expected, pullback = get_candle_prediction(signal_type, score, green, red)
+    # Smart Candle Prediction
+    streak, last_color = get_recent_candle_streak(df, 12)
+    base = max(3, min(9, int(abs(score) * 1.5)))
+    
+    if "BUY" in signal_type:
+        expected = f"{base}–{base+3} green candles expected"
+        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} red candles pullback"
+    elif "SELL" in signal_type:
+        expected = f"{base}–{base+3} red candles expected"
+        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} green candles pullback"
+    else:
+        expected = "Market is neutral"
+        pullback = ""
     
     return {
         "signal": signal_type, "badge_class": badge_class, "score": score, "reasons": reasons,
@@ -187,26 +209,6 @@ def calculate_signal_and_levels(df):
         "expected_candles": expected, "pullback": pullback
     }
 
-def get_recent_candle_color(df, lookback=12):
-    if len(df) < lookback: lookback = len(df)
-    recent = df.tail(lookback)
-    green = (recent['Close'] > recent['Open']).sum()
-    red = (recent['Close'] < recent['Open']).sum()
-    return green, red
-
-def get_candle_prediction(signal_type, score, recent_green, recent_red):
-    base = max(3, min(9, int(score * 1.4)))
-    if "BUY" in signal_type:
-        expected = f"{base}–{base+3} green candles expected"
-        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} red candles pullback in between"
-    elif "SELL" in signal_type:
-        expected = f"{base}–{base+3} red candles expected"
-        pullback = f"Possible {max(1, base//3)}–{max(2, base//2)} green candles pullback in between"
-    else:
-        expected = "Market is neutral"
-        pullback = ""
-    return expected, pullback
-
 def build_chart(df, analysis, symbol_name, tf):
     if df is None or analysis is None: return None
     fig = go.Figure()
@@ -214,29 +216,28 @@ def build_chart(df, analysis, symbol_name, tf):
         low=df['Low'], close=df['Close'], name="Price",
         increasing_line_color="#00c853", decreasing_line_color="#f44336"))
     
-    # Arrow
     last_price = float(df['Close'].iloc[-1])
     if "BUY" in analysis['signal']:
-        fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price * 0.995,
-            text="▲ LONG", showarrow=True, arrowhead=2, arrowsize=1.5,
-            arrowcolor="#00c853", font=dict(color="#00c853", size=14))
+        fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price*0.992,
+            text="▲ LONG", showarrow=True, arrowhead=2, arrowsize=1.8,
+            arrowcolor="#00c853", font=dict(color="#00c853", size=15, family="Arial Black"))
     elif "SELL" in analysis['signal']:
-        fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price * 1.005,
-            text="▼ SHORT", showarrow=True, arrowhead=2, arrowsize=1.5,
-            arrowcolor="#f44336", font=dict(color="#f44336", size=14))
+        fig.add_annotation(x=df['Datetime'].iloc[-1], y=last_price*1.008,
+            text="▼ SHORT", showarrow=True, arrowhead=2, arrowsize=1.8,
+            arrowcolor="#f44336", font=dict(color="#f44336", size=15, family="Arial Black"))
     
     fig.update_layout(title=f"{symbol_name} — {tf} | {analysis['signal']}", template="plotly_dark",
-        height=420, margin=dict(l=10, r=10, t=50, b=10), xaxis_rangeslider_visible=False)
+        height=400, margin=dict(l=10, r=10, t=50, b=10), xaxis_rangeslider_visible=False)
     return fig
 
 st.markdown('<h1 class="main-header">📈 Pro Trading Signals</h1>', unsafe_allow_html=True)
-st.caption("BTC • USDJPY • NAS100 | Improved Professional Signals")
+st.caption(f"Pakistan Time: {get_pakistan_time()}  |  BTC • USDJPY • NAS100")
 
 if st.button("🔄 Refresh All Data"):
     st.cache_data.clear()
     st.rerun()
 
-# Grid layout
+# Grid Layout
 cols = st.columns(3)
 for idx, (disp_name, meta) in enumerate(list(MAIN_SYMBOLS.items())):
     col = cols[idx % 3]
@@ -289,7 +290,6 @@ if st.session_state.selected_symbol:
         if fig:
             st.plotly_chart(fig, use_container_width=True)
         
-        # Trade Setup
         st.markdown("### 🎯 Trade Setup")
         st.markdown(f"<span class='signal-badge {analysis['badge_class']}' style='font-size:1.3rem; padding:0.4rem 1.2rem;'>{analysis['signal']}</span>", unsafe_allow_html=True)
         
@@ -304,16 +304,15 @@ if st.session_state.selected_symbol:
         
         st.code(f"Entry: {analysis['entry']}\nSL: {analysis['sl']}\nTP1: {analysis['tp1']}  TP2: {analysis['tp2']}  TP3: {analysis['tp3']}")
         
-        # Candle Prediction
-        st.markdown("### 🕯️ Candle Prediction")
+        st.markdown("### 🕯️ Expected Candles")
         st.info(analysis['expected_candles'])
-        if analysis['pullback']:
+        if analysis.get('pullback'):
             st.warning(analysis['pullback'])
         
         st.markdown("### 🧠 Why this signal?")
         for r in analysis['reasons']:
             st.write(r)
     else:
-        st.error("Not enough data for this timeframe.")
+        st.error("Not enough data for this timeframe. Try higher timeframe.")
 
 st.caption("Professional Signals • Free Tier • Data via yfinance • Verify with your broker")
